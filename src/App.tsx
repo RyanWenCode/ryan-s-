@@ -34,18 +34,24 @@ interface EnemyRocket extends Entity {
   speed: number;
 }
 
+type MissileType = 'NORMAL' | 'RARE' | 'LIGHTNING' | 'DRONE';
+
 interface InterceptorMissile extends Entity {
   startX: number;
   startY: number;
   targetX: number;
   targetY: number;
   progress: number;
+  type: MissileType;
+  hoverTimer?: number;
+  hasFired?: boolean;
 }
 
 interface Explosion extends Entity {
   radius: number;
   maxRadius: number;
   life: number; // 0 to 1
+  isRare?: boolean;
 }
 
 interface City extends Entity {
@@ -106,6 +112,8 @@ export default function App() {
   const [score, setScore] = useState(0);
   const [lang, setLang] = useState<Language>('zh');
   const [ammo, setAmmo] = useState(INITIAL_AMMO);
+  const [isPaused, setIsPaused] = useState(false);
+  const [isBgLoaded, setIsBgLoaded] = useState(false);
   
   // Game Objects Refs
   const enemiesRef = useRef<EnemyRocket[]>([]);
@@ -117,20 +125,13 @@ export default function App() {
   const requestRef = useRef<number>(null);
   const scoreRef = useRef(0);
   const gameStateRef = useRef<GameState>('START');
+  const isPausedRef = useRef(false);
   const bgImageRef = useRef<HTMLImageElement | null>(null);
+  const mousePosRef = useRef({ x: 0, y: 0 });
 
   const t = TRANSLATIONS[lang];
 
-  // Load background image
-  useEffect(() => {
-    const img = new Image();
-    img.src = 'https://images.unsplash.com/photo-1614728263952-84ea256f9679?q=80&w=1920'; // Epic mythical background
-    img.onload = () => {
-      bgImageRef.current = img;
-    };
-  }, []);
-
-  // Sync refs with state for game loop access
+  // Sync refs with state
   useEffect(() => {
     scoreRef.current = score;
   }, [score]);
@@ -138,6 +139,20 @@ export default function App() {
   useEffect(() => {
     gameStateRef.current = gameState;
   }, [gameState]);
+
+  useEffect(() => {
+    isPausedRef.current = isPaused;
+  }, [isPaused]);
+
+  // Load background image
+  useEffect(() => {
+    const img = new Image();
+    img.src = 'https://images.unsplash.com/photo-1614728263952-84ea256f9679?q=80&w=1920';
+    img.onload = () => {
+      bgImageRef.current = img;
+      setIsBgLoaded(true);
+    };
+  }, []);
 
   // Initialize Game Objects (Positions and State)
   const initGame = useCallback(() => {
@@ -222,7 +237,7 @@ export default function App() {
   }, []);
 
   const fireMissile = (targetX: number, targetY: number) => {
-    if (gameStateRef.current !== 'PLAYING') return;
+    if (gameStateRef.current !== 'PLAYING' || isPausedRef.current) return;
 
     let bestBattery: Battery | null = null;
     let minDist = Infinity;
@@ -245,6 +260,12 @@ export default function App() {
         right: batteriesRef.current[2].ammo,
       });
 
+      const rand = Math.random();
+      let type: MissileType = 'NORMAL';
+      if (rand < 0.1) type = 'RARE';
+      else if (rand < 0.25) type = 'LIGHTNING';
+      else if (rand < 0.4) type = 'DRONE';
+
       const missile: InterceptorMissile = {
         id: Math.random().toString(36).substr(2, 9),
         startX: bestBattery.x,
@@ -254,6 +275,8 @@ export default function App() {
         x: bestBattery.x,
         y: bestBattery.y,
         progress: 0,
+        type,
+        hoverTimer: type === 'DRONE' ? 180 : 0, // 3 seconds at 60fps
       };
       missilesRef.current.push(missile);
     }
@@ -261,6 +284,10 @@ export default function App() {
 
   const update = useCallback((time: number) => {
     if (gameStateRef.current !== 'PLAYING') return;
+    if (isPausedRef.current) {
+      requestRef.current = requestAnimationFrame(update);
+      return;
+    }
 
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -365,21 +392,30 @@ export default function App() {
       const dy = m.targetY - m.startY;
       const dist = Math.sqrt(dx * dx + dy * dy);
       
-      m.progress += MISSILE_SPEED / dist;
-      m.x = m.startX + dx * m.progress;
-      m.y = m.startY + dy * m.progress;
+      if (m.progress < 1) {
+        m.progress += MISSILE_SPEED / dist;
+        m.x = m.startX + dx * m.progress;
+        m.y = m.startY + dy * m.progress;
+      }
 
+      // Draw trail
       ctx.beginPath();
-      ctx.strokeStyle = '#4488ff';
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = m.type === 'RARE' ? '#ffcc00' : m.type === 'LIGHTNING' ? '#00ffff' : m.type === 'DRONE' ? '#00ff00' : '#4488ff';
+      ctx.lineWidth = m.type === 'RARE' ? 4 : 2;
       ctx.moveTo(m.startX, m.startY);
       ctx.lineTo(m.x, m.y);
       ctx.stroke();
 
       // Draw head as rocket
       const angle = Math.atan2(dy, dx);
-      drawRocket(m.x, m.y, angle, '#4488ff', 1);
+      let rocketColor = '#4488ff';
+      if (m.type === 'RARE') rocketColor = '#ffcc00';
+      if (m.type === 'LIGHTNING') rocketColor = '#00ffff';
+      if (m.type === 'DRONE') rocketColor = '#00ff00';
+      
+      drawRocket(m.x, m.y, angle, rocketColor, m.type === 'RARE' ? 1.5 : 1);
 
+      // Draw target X
       ctx.beginPath();
       ctx.strokeStyle = '#fff';
       ctx.lineWidth = 1;
@@ -390,14 +426,137 @@ export default function App() {
       ctx.stroke();
 
       if (m.progress >= 1) {
-        explosionsRef.current.push({
-          id: `exp-${Math.random()}`,
-          x: m.targetX,
-          y: m.targetY,
-          radius: 0,
-          maxRadius: EXPLOSION_RADIUS,
-          life: 1,
-        });
+        if (m.type === 'DRONE') {
+          if (m.hoverTimer && m.hoverTimer > 0) {
+            m.hoverTimer--;
+            
+            // Drone visual: pulsing circle and drone body
+            ctx.save();
+            ctx.translate(m.x, m.y);
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(0, 0, 10 + Math.sin(time / 5) * 5, 0, Math.PI * 2);
+            ctx.stroke();
+            
+            // Draw drone legs/arms
+            for (let i = 0; i < 4; i++) {
+              ctx.rotate(Math.PI / 2);
+              ctx.beginPath();
+              ctx.moveTo(5, 0);
+              ctx.lineTo(15, 0);
+              ctx.stroke();
+              ctx.fillStyle = '#00ff00';
+              ctx.fillRect(13, -2, 4, 4);
+            }
+            ctx.restore();
+
+            // Fire small sub-bombs while hovering
+            if (m.hoverTimer % 20 === 0) {
+              const angle = Math.random() * Math.PI * 2;
+              const dist = Math.random() * 150 + 50;
+              explosionsRef.current.push({
+                id: `drone-sub-exp-${Math.random()}`,
+                x: m.x + Math.cos(angle) * dist,
+                y: m.y + Math.sin(angle) * dist,
+                radius: 0,
+                maxRadius: EXPLOSION_RADIUS * 0.6,
+                life: 1,
+              });
+            }
+            return true;
+          } else {
+            // Final burst
+            for (let i = 0; i < 12; i++) {
+              const angle = (i / 12) * Math.PI * 2;
+              explosionsRef.current.push({
+                id: `drone-final-exp-${Math.random()}`,
+                x: m.x + Math.cos(angle) * 80,
+                y: m.y + Math.sin(angle) * 80,
+                radius: 0,
+                maxRadius: EXPLOSION_RADIUS,
+                life: 1,
+              });
+            }
+            return false;
+          }
+        }
+
+        if (m.type === 'RARE') {
+          // Super explosion
+          explosionsRef.current.push({
+            id: `rare-exp-${Math.random()}`,
+            x: m.x,
+            y: m.y,
+            radius: 0,
+            maxRadius: Math.max(width, height) * 1.5, // Screen wide
+            life: 1,
+            isRare: true,
+          });
+        } else if (m.type === 'LIGHTNING') {
+          // Lightning effect
+          ctx.save();
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 2;
+          ctx.shadowBlur = 20;
+          ctx.shadowColor = '#00ffff';
+          
+          const nearbyEnemies = enemiesRef.current.filter(e => {
+            const edx = e.x - m.x;
+            const edy = e.y - m.y;
+            return Math.sqrt(edx * edx + edy * edy) < 300;
+          });
+
+          nearbyEnemies.forEach((e, index) => {
+            if (index % 2 === 0) { // Clear half
+              // Draw lightning bolt
+              ctx.beginPath();
+              ctx.moveTo(m.x, m.y);
+              let lx = m.x;
+              let ly = m.y;
+              for (let j = 0; j < 5; j++) {
+                lx += (e.x - lx) * 0.2 + (Math.random() - 0.5) * 40;
+                ly += (e.y - ly) * 0.2 + (Math.random() - 0.5) * 40;
+                ctx.lineTo(lx, ly);
+              }
+              ctx.lineTo(e.x, e.y);
+              ctx.stroke();
+              
+              // Kill enemy
+              enemiesRef.current = enemiesRef.current.filter(en => en.id !== e.id);
+              setScore(s => s + 20);
+              
+              explosionsRef.current.push({
+                id: `lightning-exp-${Math.random()}`,
+                x: e.x,
+                y: e.y,
+                radius: 0,
+                maxRadius: 20,
+                life: 0.5,
+              });
+            }
+          });
+          ctx.restore();
+          
+          explosionsRef.current.push({
+            id: `exp-${Math.random()}`,
+            x: m.targetX,
+            y: m.targetY,
+            radius: 0,
+            maxRadius: EXPLOSION_RADIUS,
+            life: 1,
+          });
+        } else {
+          // Normal explosion
+          explosionsRef.current.push({
+            id: `exp-${Math.random()}`,
+            x: m.targetX,
+            y: m.targetY,
+            radius: 0,
+            maxRadius: EXPLOSION_RADIUS,
+            life: 1,
+          });
+        }
         return false;
       }
       return true;
@@ -457,6 +616,14 @@ export default function App() {
       
       ctx.restore();
 
+      // Rare bomb enemy clearing logic: clear when explosion is at peak
+      if (exp.isRare && exp.life < 0.6 && exp.life > 0.4) {
+        if (enemiesRef.current.length > 0) {
+          setScore(s => s + enemiesRef.current.length * 20);
+          enemiesRef.current = [];
+        }
+      }
+
       enemiesRef.current = enemiesRef.current.filter(enemy => {
         const edx = enemy.x - exp.x;
         const edy = enemy.y - exp.y;
@@ -492,30 +659,102 @@ export default function App() {
     // Draw Cities
     citiesRef.current.forEach(city => {
       if (city.active) {
-        ctx.fillStyle = '#4ade80';
-        ctx.fillRect(city.x - 15, city.y, 30, 20);
-        ctx.fillRect(city.x - 10, city.y - 10, 20, 10);
+        ctx.save();
+        ctx.translate(city.x, city.y);
+        
+        // House Body
+        ctx.fillStyle = '#f3f4f6';
+        ctx.fillRect(-15, 0, 30, 20);
+        
+        // Roof
+        ctx.fillStyle = '#ef4444';
+        ctx.beginPath();
+        ctx.moveTo(-18, 0);
+        ctx.lineTo(18, 0);
+        ctx.lineTo(0, -15);
+        ctx.closePath();
+        ctx.fill();
+        
+        // Door
+        ctx.fillStyle = '#4b5563';
+        ctx.fillRect(-4, 8, 8, 12);
+        
+        // Windows with glow
+        ctx.fillStyle = '#fef08a';
+        ctx.shadowBlur = 5;
+        ctx.shadowColor = '#facc15';
+        ctx.fillRect(-10, 4, 6, 6);
+        ctx.fillRect(4, 4, 6, 6);
+        
+        ctx.restore();
       }
     });
 
     // Draw Batteries
     batteriesRef.current.forEach(b => {
       if (b.active) {
-        ctx.fillStyle = '#60a5fa';
+        ctx.save();
+        ctx.translate(b.x, b.y);
+        
+        // Base
+        ctx.fillStyle = '#374151';
         ctx.beginPath();
-        ctx.moveTo(b.x - 20, b.y + 20);
-        ctx.lineTo(b.x + 20, b.y + 20);
-        ctx.lineTo(b.x, b.y - 10);
+        ctx.moveTo(-25, 20);
+        ctx.lineTo(25, 20);
+        ctx.lineTo(15, 0);
+        ctx.lineTo(-15, 0);
         ctx.closePath();
         ctx.fill();
         
+        // Mechanical details on base
+        ctx.strokeStyle = '#1f2937';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(-20, 5, 40, 10);
+        
+        // Turret Head (Rotating)
+        const angle = Math.atan2(mousePosRef.current.y - b.y, mousePosRef.current.x - b.x);
+        ctx.rotate(angle);
+        
+        // Barrel
+        const gradient = ctx.createLinearGradient(0, -5, 30, 5);
+        gradient.addColorStop(0, '#60a5fa');
+        gradient.addColorStop(1, '#2563eb');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, -5, 35, 10);
+        
+        // Barrel Tip
+        ctx.fillStyle = '#93c5fd';
+        ctx.fillRect(32, -6, 5, 12);
+        
+        // Turret Body
+        ctx.fillStyle = '#4b5563';
+        ctx.beginPath();
+        ctx.arc(0, 0, 12, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Glowing core
+        ctx.fillStyle = '#60a5fa';
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = '#3b82f6';
+        ctx.beginPath();
+        ctx.arc(0, 0, 5, 0, Math.PI * 2);
+        ctx.fill();
+        
+        ctx.restore();
+        
+        // Ammo text
         ctx.fillStyle = '#fff';
-        ctx.font = '10px monospace';
+        ctx.font = 'bold 12px monospace';
         ctx.textAlign = 'center';
-        ctx.fillText(b.ammo.toString(), b.x, b.y + 35);
+        ctx.fillText(b.ammo.toString(), b.x, b.y + 40);
       } else {
+        // Destroyed battery
+        ctx.fillStyle = '#1f2937';
+        ctx.fillRect(b.x - 20, b.y + 10, 40, 10);
         ctx.fillStyle = '#444';
-        ctx.fillRect(b.x - 10, b.y, 20, 10);
+        ctx.beginPath();
+        ctx.arc(b.x, b.y + 5, 10, 0, Math.PI * 2);
+        ctx.fill();
       }
     });
 
@@ -566,6 +805,16 @@ export default function App() {
     fireMissile(x, y);
   };
 
+  const handleMouseMove = (e: React.MouseEvent) => {
+    mousePosRef.current = { x: e.clientX, y: e.clientY };
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (e.touches.length > 0) {
+      mousePosRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+  };
+
   const startGame = () => {
     initGame();
     setGameState('PLAYING');
@@ -579,6 +828,8 @@ export default function App() {
         className="block w-full h-full cursor-crosshair"
         onMouseDown={handleCanvasClick}
         onTouchStart={handleCanvasClick}
+        onMouseMove={handleMouseMove}
+        onTouchMove={handleTouchMove}
       />
 
       {/* UI Overlay */}
@@ -594,6 +845,14 @@ export default function App() {
         </div>
 
         <div className="flex gap-2 pointer-events-auto">
+          {gameState === 'PLAYING' && (
+            <button
+              onClick={() => setIsPaused(!isPaused)}
+              className="p-2 bg-white/10 hover:bg-white/20 rounded-full transition-colors border border-white/10"
+            >
+              {isPaused ? <RefreshCw className="w-4 h-4" /> : <div className="w-4 h-4 flex items-center justify-center font-bold">||</div>}
+            </button>
+          )}
           <button
             onClick={() => setLang(l => l === 'zh' ? 'en' : 'zh')}
             className="p-2 bg-white/10 hover:bg-white/20 rounded-full transition-colors border border-white/10"
@@ -618,6 +877,16 @@ export default function App() {
           </div>
         ))}
       </div>
+
+      {/* Loading Screen */}
+      {!isBgLoaded && (
+        <div className="absolute inset-0 bg-[#0a0a0a] flex items-center justify-center z-[100]">
+          <div className="flex flex-col items-center gap-4">
+            <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
+            <p className="text-blue-400 font-mono text-sm animate-pulse">LOADING ASSETS...</p>
+          </div>
+        </div>
+      )}
 
       {/* Modals */}
       <AnimatePresence>
